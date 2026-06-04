@@ -1,0 +1,13 @@
+# 비밀 정보가 든 실행 스크립트 (토큰 노출 방지)
+run.sh
+
+# 봇이 실행 중 생성하는 상태 파일
+watchlist.json
+sent_today.json
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 로컬 Claude Code 설정
+.claude/
