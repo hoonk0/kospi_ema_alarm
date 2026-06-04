@@ -36,8 +36,27 @@ import os
 import json
 import logging
 import asyncio
+import socket
 from datetime import datetime, timedelta, time as dtime
 from typing import Dict, List, Optional, Tuple
+
+# ----------------------------------------------------------------------------
+# 네트워크: IPv4 우선 사용
+#   일부 회선(예: 일부 라즈베리파이 환경)에서는 텔레그램 서버로 가는 IPv6 경로가
+#   매우 느려(연결에만 5초 이상) 기본 타임아웃에 걸려 봇이 뜨지 않습니다.
+#   getaddrinfo 결과에서 IPv4 주소를 앞으로 정렬해 IPv4 로 먼저 붙도록 합니다.
+#   (IPv4 가 없으면 IPv6 로 자연스럽게 폴백)
+# ----------------------------------------------------------------------------
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _prefer_ipv4_getaddrinfo(*args, **kwargs):
+    results = _orig_getaddrinfo(*args, **kwargs)
+    results.sort(key=lambda r: 0 if r[0] == socket.AF_INET else 1)
+    return results
+
+
+socket.getaddrinfo = _prefer_ipv4_getaddrinfo
 
 import pandas as pd
 import pytz
@@ -652,7 +671,18 @@ def main() -> None:
     # 워치리스트 기본값 채워두기
     ensure_default_watchlist()
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # connect_timeout 을 넉넉히 둬서 회선이 느려도 부팅 실패하지 않도록 함
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30.0)
+        .pool_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .get_updates_connect_timeout(30.0)
+        .get_updates_pool_timeout(30.0)
+        .build()
+    )
 
     # 명령어 핸들러 등록
     app.add_handler(CommandHandler("start", cmd_start))
