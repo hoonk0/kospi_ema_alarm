@@ -493,7 +493,7 @@ HELP_TEXT = (
     "/list - 현재 감시 중인 종목 보기\n"
     "/set - 종목 알람 기한 설정 (대화형)\n"
     "/check - 지금 즉시 1회 EMA 체크 실행\n"
-    "/stop_code <종목코드> - 해당 종목 감시 즉시 해제\n\n"
+    "/stop\\_code <종목코드> - 해당 종목 감시 즉시 해제\n\n"
     f"*조건*: 현재가가 EMA 라인 ±{TOUCH_THRESHOLD_PCT}% 범위 진입 시 알람\n"
     "  - 일봉 EMA 5/20/60/120\n"
     "  - 주봉 EMA 5/30\n"
