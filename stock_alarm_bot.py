@@ -234,19 +234,13 @@ def mark_sent_today(code: str, ma_label: str) -> None:
 
 
 # ============================================================================
-# 워치리스트 초기화 : WATCH_TARGETS 의 모든 종목을 '무제한'으로 기본 등록
-#   (사용자가 /list, /set 등으로 개별 조정 가능)
+# 워치리스트 로드 (opt-in 방식)
+#   - 기본은 '빈 목록' : 아무 종목도 감시하지 않음
+#   - 사용자가 /watch 로 켠 종목만 watchlist.json 에 들어가고, 그것만 감시함
+#   - WATCH_TARGETS 는 '고를 수 있는 전체 후보 목록(카탈로그)' 역할만 함
 # ============================================================================
 def ensure_default_watchlist() -> Dict[str, Dict]:
-    wl = load_watchlist()
-    changed = False
-    for code, name in WATCH_TARGETS.items():
-        if code not in wl:
-            wl[code] = {"name": name, "expire": None}  # None = 무제한
-            changed = True
-    if changed:
-        save_watchlist(wl)
-    return wl
+    return load_watchlist()
 
 
 # ============================================================================
@@ -499,6 +493,7 @@ HELP_TEXT = (
     "/start - 봇 시작 & 도움말\n"
     "/help - 도움말\n"
     "/myid - 내 챗ID 확인 (알람 수신자 추가용)\n"
+    "/watch - 알람 받을 종목 선택 (켜기✅/끄기⬜)\n"
     "/list - 현재 감시 중인 종목 보기\n"
     "/set - 종목 알람 기한 설정 (대화형)\n"
     "/check - 지금 즉시 1회 EMA 체크 실행\n"
@@ -532,6 +527,64 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "이 ID를 관리자에게 알려주면 알람 수신자로 추가할 수 있습니다.",
         parse_mode="Markdown",
     )
+
+
+# ----------------------------------------------------------------------------
+# /watch : 종목 ON/OFF 토글 (체크박스형 인라인 키보드)
+#   - WATCH_TARGETS(전체 후보) 를 버튼으로 펼쳐 보여주고
+#   - 켜진 종목엔 ✅, 꺼진 종목엔 ⬜ 표시
+#   - 버튼을 탭하면 즉시 ON↔OFF 전환되고 키보드가 갱신됨
+# ----------------------------------------------------------------------------
+def build_watch_keyboard() -> InlineKeyboardMarkup:
+    wl = load_watchlist()
+    items = sorted(WATCH_TARGETS.items(), key=lambda kv: kv[1])
+    buttons = []
+    row = []
+    for code, name in items:
+        mark = "✅" if code in wl else "⬜"
+        row.append(InlineKeyboardButton(f"{mark} {name}", callback_data=f"watch|{code}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    wl = load_watchlist()
+    await update.message.reply_text(
+        f"🔔 *알람 받을 종목 선택* (현재 {len(wl)}개 켜짐)\n"
+        "탭하면 켜짐 ✅ / 꺼짐 ⬜ 으로 전환됩니다.",
+        reply_markup=build_watch_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, code = query.data.split("|", 1)
+    name = WATCH_TARGETS.get(code, code)
+
+    wl = load_watchlist()
+    if code in wl:
+        del wl[code]
+        await query.answer(f"⬜ {name} 알람 꺼짐")
+    else:
+        wl[code] = {"name": name, "expire": None}  # None = 무제한
+        await query.answer(f"✅ {name} 알람 켜짐")
+    save_watchlist(wl)
+
+    # 키보드(체크표시) 갱신 + 상단 카운트 갱신
+    try:
+        await query.edit_message_text(
+            f"🔔 *알람 받을 종목 선택* (현재 {len(wl)}개 켜짐)\n"
+            "탭하면 켜짐 ✅ / 꺼짐 ⬜ 으로 전환됩니다.",
+            reply_markup=build_watch_keyboard(),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -712,12 +765,14 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("watch", cmd_watch))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("stop_code", cmd_stop_code))
 
     # 인라인 버튼 콜백
+    app.add_handler(CallbackQueryHandler(cb_watch, pattern=r"^watch\|"))
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick\|"))
     app.add_handler(CallbackQueryHandler(cb_days, pattern=r"^days\|"))
 
