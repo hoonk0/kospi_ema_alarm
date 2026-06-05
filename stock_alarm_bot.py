@@ -79,6 +79,13 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "여기에_봇_토큰_입력")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "여기에_챗ID_입력")
 
+# 알람을 받을 챗ID 목록.
+#   여러 명에게 보내려면 환경변수에 쉼표로 구분해 넣으면 됩니다.
+#     예) TELEGRAM_CHAT_ID="1567993608,123456789,987654321"
+#   ※ 각 사람은 먼저 봇에게 /start 를 한 번 보내야 메시지를 받을 수 있습니다.
+#     (봇한테 /myid 를 보내면 본인 챗ID를 알려줍니다.)
+CHAT_IDS = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
+
 # 이평선 ±N% 진입 시 알람 (요구사항: 0.5%)
 TOUCH_THRESHOLD_PCT = 0.5
 
@@ -457,25 +464,26 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("감시 대상 없음")
         return
 
-    logger.info(f"EMA 체크 시작 ({len(targets)} 종목)")
+    logger.info(f"EMA 체크 시작 ({len(targets)} 종목, 수신자 {len(CHAT_IDS)}명)")
     bot = context.bot
-    chat_id = TELEGRAM_CHAT_ID
 
     alerts_total = 0
     for code, name in targets:
         try:
             msgs = build_alerts_for_code(code, name)
             for m in msgs:
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=m,
-                        parse_mode="Markdown",
-                    )
-                    alerts_total += 1
-                    await asyncio.sleep(0.3)  # 텔레그램 rate-limit 보호
-                except Exception as e:
-                    logger.warning(f"메시지 전송 실패: {e}")
+                # 같은 알람을 등록된 모든 수신자에게 발송
+                for cid in CHAT_IDS:
+                    try:
+                        await bot.send_message(
+                            chat_id=cid,
+                            text=m,
+                            parse_mode="Markdown",
+                        )
+                        alerts_total += 1
+                        await asyncio.sleep(0.3)  # 텔레그램 rate-limit 보호
+                    except Exception as e:
+                        logger.warning(f"메시지 전송 실패 (chat {cid}): {e}")
         except Exception as e:
             logger.warning(f"[{code}] 체크 중 오류: {e}")
 
@@ -490,6 +498,7 @@ HELP_TEXT = (
     "*명령어*\n"
     "/start - 봇 시작 & 도움말\n"
     "/help - 도움말\n"
+    "/myid - 내 챗ID 확인 (알람 수신자 추가용)\n"
     "/list - 현재 감시 중인 종목 보기\n"
     "/set - 종목 알람 기한 설정 (대화형)\n"
     "/check - 지금 즉시 1회 EMA 체크 실행\n"
@@ -508,6 +517,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """본인 챗ID를 알려준다. 새 수신자를 추가할 때 이 ID를 관리자에게 전달하면 됩니다."""
+    chat = update.effective_chat
+    user = update.effective_user
+    name = user.full_name if user else ""
+    registered = "✅ 이미 등록됨" if str(chat.id) in CHAT_IDS else "❌ 아직 미등록"
+    await update.message.reply_text(
+        f"🆔 *당신의 챗ID*: `{chat.id}`\n"
+        f"   이름: {name}\n"
+        f"   알람 수신: {registered}\n\n"
+        "이 ID를 관리자에게 알려주면 알람 수신자로 추가할 수 있습니다.",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -687,6 +711,7 @@ def main() -> None:
     # 명령어 핸들러 등록
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("check", cmd_check))
