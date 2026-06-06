@@ -13,7 +13,7 @@
  - python-telegram-bot 의 JobQueue 로 장중/장마감 주기 체크
 
 [설치]
-    pip install python-telegram-bot==20.7 finance-datareader pandas pytz
+    pip install "python-telegram-bot[job-queue]" finance-datareader pandas pytz holidays
 
     # (선택) FinanceDataReader 가 코스피 종목 메타 조회가 막혀있을 때 백업용
     pip install pykrx
@@ -61,6 +61,9 @@ socket.getaddrinfo = _prefer_ipv4_getaddrinfo
 import pandas as pd
 import pytz
 
+# 한국 공휴일(휴장일) 판정
+import holidays as pyholidays
+
 # 데이터 수집: FinanceDataReader 사용 (간편함, 무료, 한국주식 잘 지원)
 import FinanceDataReader as fdr
 
@@ -93,14 +96,20 @@ WATCHLIST_FILE = "watchlist.json"
 # 같은 종목/같은 이평선 알람이 하루에 여러 번 가지 않도록 중복 방지
 SENT_LOG_FILE = "sent_today.json"
 
+# 사용자별로 '어떤 EMA 라인 알람을 받을지' 저장하는 파일
+EMA_PREF_FILE = "ema_prefs.json"
+
 # 한국 시간대
 KST = pytz.timezone("Asia/Seoul")
 
 # 체크할 지수이동평균(EMA) 정의
 #   - 단순이동평균(SMA)이 아닌 지수이동평균(EMA) 기준으로 계산합니다.
 #   - EMA 는 최근 봉에 더 큰 가중치를 부여하여 추세 변화에 빠르게 반응합니다.
-DAILY_EMAS = [5, 20, 60, 120]      # 일봉 EMA
+DAILY_EMAS = [5, 20, 60, 120]      # 일봉 EMA (선택 가능한 전체 후보)
 WEEKLY_EMAS = [5, 20]               # 주봉 EMA (5주, 20주)
+
+# 한국 공휴일 객체 (연도 접근 시 자동 계산, 대체공휴일 포함)
+_KR_HOLIDAYS = pyholidays.SouthKorea()
 
 
 # ============================================================================
@@ -250,6 +259,27 @@ def mark_sent_today(chat_id, code: str, ma_label: str) -> None:
         save_sent_log(data)
 
 
+# ----------------------------------------------------------------------------
+# 사용자별 EMA 라인 선택 (6개 중 받고 싶은 것만)
+#   저장 구조: { "챗ID": {"daily": [5,20,...], "weekly": [5,20]} }
+#   설정이 없으면 기본값 = 전체 ON
+# ----------------------------------------------------------------------------
+def get_user_ema_pref(chat_id) -> Dict[str, List[int]]:
+    prefs = load_json(EMA_PREF_FILE, {}).get(str(chat_id))
+    if not prefs:
+        return {"daily": list(DAILY_EMAS), "weekly": list(WEEKLY_EMAS)}
+    return {
+        "daily": prefs.get("daily", list(DAILY_EMAS)),
+        "weekly": prefs.get("weekly", list(WEEKLY_EMAS)),
+    }
+
+
+def save_user_ema_pref(chat_id, pref: Dict[str, List[int]]) -> None:
+    data = load_json(EMA_PREF_FILE, {})
+    data[str(chat_id)] = pref
+    save_json(EMA_PREF_FILE, data)
+
+
 # ============================================================================
 # 워치리스트 방식 메모 (opt-in, 사람별)
 #   - 기본은 '빈 목록' : 아무도/아무 종목도 감시하지 않음
@@ -342,10 +372,12 @@ def detect_breakout(
 # ============================================================================
 # 핵심 체크 로직 : 한 종목의 돌파 알람 계산
 #   - 사용자와 무관하게 '이 종목이 지금 어떤 EMA 를 돌파했는지'만 계산한다.
-#   - 중복방지/발송은 호출하는 쪽(scheduled_check)에서 사용자별로 처리한다.
-#   - 반환: [(sent_key, 메시지), ...]   sent_key = "라벨|방향" (예: "일봉 EMA20|상승")
+#   - 중복방지/발송/EMA라인 필터는 호출하는 쪽(scheduled_check)에서 사용자별로 처리.
+#   - 반환: [(kind, w, sent_key, 메시지), ...]
+#       kind = "daily" | "weekly", w = 기간(int)
+#       sent_key = "라벨|방향" (예: "일봉 EMA20|상승")
 # ============================================================================
-def compute_alerts_for_code(code: str, name: str) -> List[Tuple[str, str]]:
+def compute_alerts_for_code(code: str, name: str) -> List[Tuple[str, int, str, str]]:
     df = fetch_price_df(code, days=400)
     if df is None or df.empty:
         return []
@@ -360,7 +392,7 @@ def compute_alerts_for_code(code: str, name: str) -> List[Tuple[str, str]]:
     daily_emas = compute_daily_emas(df, DAILY_EMAS)
     weekly_emas = compute_weekly_emas(df, WEEKLY_EMAS)
 
-    alerts: List[Tuple[str, str]] = []
+    alerts: List[Tuple[str, int, str, str]] = []
 
     def fmt_msg(ema_label: str, ema_val: float, direction: str) -> str:
         diff_pct = (last_close - ema_val) / ema_val * 100.0
@@ -387,7 +419,7 @@ def compute_alerts_for_code(code: str, name: str) -> List[Tuple[str, str]]:
         if direction is None:
             continue
         label = f"일봉 EMA{w}"
-        alerts.append((f"{label}|{direction}", fmt_msg(label, curr_ema, direction)))
+        alerts.append(("daily", w, f"{label}|{direction}", fmt_msg(label, curr_ema, direction)))
 
     # ----- 주봉 EMA 돌파 체크 -----
     # 주봉 EMA 는 주중에는 값이 거의 고정되므로, 일일 종가 변화로 돌파 여부를 판정한다.
@@ -402,7 +434,7 @@ def compute_alerts_for_code(code: str, name: str) -> List[Tuple[str, str]]:
         if direction is None:
             continue
         label = f"주봉 EMA{w}"
-        alerts.append((f"{label}|{direction}", fmt_msg(label, curr_ema, direction)))
+        alerts.append(("weekly", w, f"{label}|{direction}", fmt_msg(label, curr_ema, direction)))
 
     return alerts
 
@@ -455,16 +487,30 @@ def get_active_user_targets() -> Dict[str, Dict[str, str]]:
 # ============================================================================
 # JobQueue 콜백 : 주기적 체크
 # ============================================================================
+def is_market_holiday(d) -> bool:
+    """한국 증시 휴장일인지 판정.
+
+    - 공공 공휴일(설날/추석 연휴, 대체공휴일 등)은 holidays 라이브러리로 판정
+    - 증시 추가 휴장: 근로자의 날(5/1), 연말 마지막 영업일(12/31)
+    """
+    if d in _KR_HOLIDAYS:
+        return True
+    if (d.month, d.day) in [(5, 1), (12, 31)]:
+        return True
+    return False
+
+
 def is_market_window() -> bool:
     """체크를 실행할 시간대인지 판정.
 
     - 한국 주식 정규장: 평일 09:00 ~ 15:30 KST
     - 장마감 정밀 체크(15:35)도 동시에 허용하기 위해 16:00 까지 윈도우를 둠
-    - 토/일은 무조건 False
-    - 공휴일은 별도 체크 안 함 (휴장일엔 데이터가 갱신되지 않아 자연스럽게 알람 없음)
+    - 토/일·공휴일(휴장일)은 무조건 False
     """
     now = datetime.now(KST)
     if now.weekday() >= 5:        # 5=토, 6=일
+        return False
+    if is_market_holiday(now.date()):
         return False
     t = now.time()
     return dtime(9, 0) <= t <= dtime(16, 0)
@@ -473,7 +519,11 @@ def is_market_window() -> bool:
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     # 장 시간이 아니면 즉시 종료 (API 호출 절약)
     if not is_market_window():
-        logger.info("장 시간 외 — 체크 건너뜀")
+        now = datetime.now(KST)
+        if now.weekday() < 5 and is_market_holiday(now.date()):
+            logger.info("공휴일(휴장) — 체크 건너뜀")
+        else:
+            logger.info("장 시간 외 — 체크 건너뜀")
         return
 
     # 사용자별 활성 종목 { 챗ID: { 종목: 종목명 } }
@@ -495,14 +545,17 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     alerts_total = 0
     for code, name in all_codes.items():
         try:
-            alerts = compute_alerts_for_code(code, name)  # [(sent_key, 메시지)]
+            alerts = compute_alerts_for_code(code, name)  # [(kind, w, sent_key, 메시지)]
             if not alerts:
                 continue
-            # 이 종목을 켠 사용자에게만, 사용자별 중복방지를 적용해 발송
+            # 이 종목을 켠 사용자에게만, (EMA라인 선택 + 사용자별 중복방지) 적용해 발송
             for chat_id, active in user_targets.items():
                 if code not in active:
                     continue
-                for sent_key, msg in alerts:
+                ema_pref = get_user_ema_pref(chat_id)
+                for kind, w, sent_key, msg in alerts:
+                    if w not in ema_pref.get(kind, []):
+                        continue  # 이 사용자가 끈 EMA 라인 → 건너뜀
                     if already_sent_today(chat_id, code, sent_key):
                         continue
                     try:
@@ -532,6 +585,7 @@ HELP_TEXT = (
     "/help - 도움말\n"
     "/myid - 내 챗ID / 켜둔 종목 수 확인\n"
     "/watch - 알람 받을 종목 선택 (켜기✅/끄기⬜, 모두 켜기/끄기)\n"
+    "/ema - 받을 이평선 선택 (일봉5/20/60/120, 주봉5/20 중)\n"
     "/list - 내가 감시 중인 종목 보기\n"
     "/check - 지금 즉시 1회 EMA 체크 실행\n\n"
     f"*조건*: 현재가가 EMA 라인 ±{TOUCH_THRESHOLD_PCT}% 범위 진입 시 알람\n"
@@ -660,6 +714,79 @@ async def cb_watch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pass
 
 
+# ----------------------------------------------------------------------------
+# /ema : 받을 EMA 라인 선택 (6개 중 ON/OFF, 사용자별)
+# ----------------------------------------------------------------------------
+def build_ema_keyboard(chat_id) -> InlineKeyboardMarkup:
+    pref = get_user_ema_pref(chat_id)
+    buttons = []
+    # 일봉 4개 → 2열
+    row = []
+    for w in DAILY_EMAS:
+        mark = "✅" if w in pref["daily"] else "⬜"
+        row.append(InlineKeyboardButton(f"{mark} 일봉{w}", callback_data=f"ema|daily|{w}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    # 주봉 → 한 줄
+    wrow = []
+    for w in WEEKLY_EMAS:
+        mark = "✅" if w in pref["weekly"] else "⬜"
+        wrow.append(InlineKeyboardButton(f"{mark} 주봉{w}", callback_data=f"ema|weekly|{w}"))
+    buttons.append(wrow)
+    return InlineKeyboardMarkup(buttons)
+
+
+def ema_pref_summary(chat_id) -> str:
+    pref = get_user_ema_pref(chat_id)
+    d = "/".join(str(w) for w in pref["daily"]) or "없음"
+    wk = "/".join(str(w) for w in pref["weekly"]) or "없음"
+    return f"일봉 EMA {d}, 주봉 EMA {wk}"
+
+
+async def cmd_ema(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        "📊 *받을 이평선(EMA) 선택*\n"
+        "탭하면 켜짐 ✅ / 꺼짐 ⬜ 으로 전환됩니다.\n"
+        f"현재: {ema_pref_summary(chat_id)}",
+        reply_markup=build_ema_keyboard(chat_id),
+        parse_mode="Markdown",
+    )
+
+
+async def cb_ema(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    _, kind, w_str = query.data.split("|", 2)
+    w = int(w_str)
+
+    pref = get_user_ema_pref(chat_id)
+    lst = pref.get(kind, [])
+    if w in lst:
+        lst.remove(w)
+        await query.answer(f"⬜ {kind} EMA{w} 끔")
+    else:
+        lst.append(w)
+        lst.sort()
+        await query.answer(f"✅ {kind} EMA{w} 켬")
+    pref[kind] = lst
+    save_user_ema_pref(chat_id, pref)
+
+    try:
+        await query.edit_message_text(
+            "📊 *받을 이평선(EMA) 선택*\n"
+            "탭하면 켜짐 ✅ / 꺼짐 ⬜ 으로 전환됩니다.\n"
+            f"현재: {ema_pref_summary(chat_id)}",
+            reply_markup=build_ema_keyboard(chat_id),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wl = get_user_watchlist(update.effective_chat.id)
     today = datetime.now(KST).date()
@@ -722,12 +849,14 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("watch", cmd_watch))
+    app.add_handler(CommandHandler("ema", cmd_ema))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("check", cmd_check))
 
     # 인라인 버튼 콜백
     app.add_handler(CallbackQueryHandler(cb_watch_all, pattern=r"^watchall\|"))
     app.add_handler(CallbackQueryHandler(cb_watch, pattern=r"^watch\|"))
+    app.add_handler(CallbackQueryHandler(cb_ema, pattern=r"^ema\|"))
 
     # ----- 스케줄러 (JobQueue) -----
     # 한국시간 평일에만 의미가 있으므로 시간만 지정하고
