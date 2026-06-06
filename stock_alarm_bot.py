@@ -370,6 +370,49 @@ def detect_breakout(
 
 
 # ============================================================================
+# 종목 검색 (전체 KRX 목록에서 이름/코드로 찾기) — /add 용
+# ============================================================================
+_stock_listing_cache: Optional[Dict[str, str]] = None
+
+
+def get_stock_listing() -> Dict[str, str]:
+    """KRX 전체 종목 {코드: 이름}. 최초 1회 조회 후 메모리 캐시."""
+    global _stock_listing_cache
+    if _stock_listing_cache is not None:
+        return _stock_listing_cache
+    try:
+        df = fdr.StockListing("KRX")
+    except Exception as e:
+        logger.warning(f"종목 목록 조회 실패: {e}")
+        return {}
+    mapping: Dict[str, str] = {}
+    if "Code" in df.columns and "Name" in df.columns:
+        for code, name in zip(df["Code"], df["Name"]):
+            code = str(code).strip()
+            name = str(name).strip()
+            if code.isdigit() and name:
+                mapping[code.zfill(6)] = name
+    _stock_listing_cache = mapping
+    return mapping
+
+
+def search_stocks(query: str) -> List[Tuple[str, str]]:
+    """이름(부분일치) 또는 6자리 코드로 종목 검색 → [(코드, 이름)] (최대 20개)."""
+    listing = get_stock_listing()
+    q = query.strip()
+    if not q or not listing:
+        return []
+    if q.isdigit():
+        code = q.zfill(6)
+        return [(code, listing[code])] if code in listing else []
+    ql = q.lower()
+    matches = [(c, n) for c, n in listing.items() if ql in n.lower()]
+    # 이름 정확히 일치 우선, 그다음 이름 짧은 순
+    matches.sort(key=lambda cn: (cn[1].lower() != ql, len(cn[1])))
+    return matches[:20]
+
+
+# ============================================================================
 # 핵심 체크 로직 : 한 종목의 돌파 알람 계산
 #   - 사용자와 무관하게 '이 종목이 지금 어떤 EMA 를 돌파했는지'만 계산한다.
 #   - 중복방지/발송/EMA라인 필터는 호출하는 쪽(scheduled_check)에서 사용자별로 처리.
@@ -585,6 +628,7 @@ HELP_TEXT = (
     "/help - 도움말\n"
     "/myid - 내 챗ID / 켜둔 종목 수 확인\n"
     "/watch - 알람 받을 종목 선택 (켜기✅/끄기⬜, 모두 켜기/끄기)\n"
+    "/add - 원하는 종목 추가 (이름/코드로 검색, 예: /add 한미반도체)\n"
     "/ema - 받을 이평선 선택 (일봉5/20/60/120, 주봉5/20 중)\n"
     "/list - 내가 감시 중인 종목 보기\n"
     "/check - 지금 즉시 1회 EMA 체크 실행\n\n"
@@ -627,7 +671,11 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ----------------------------------------------------------------------------
 def build_watch_keyboard(chat_id) -> InlineKeyboardMarkup:
     wl = get_user_watchlist(chat_id)
-    items = sorted(WATCH_TARGETS.items(), key=lambda kv: kv[1])
+    # 35개 기본 카탈로그 + 사용자가 /add 로 추가한 커스텀 종목
+    catalog = dict(WATCH_TARGETS)
+    for code, info in wl.items():
+        catalog.setdefault(code, info.get("name", code))
+    items = sorted(catalog.items(), key=lambda kv: kv[1])
     # 맨 위에 일괄 켜기/끄기 버튼
     buttons = [[
         InlineKeyboardButton("✅ 모두 켜기", callback_data="watchall|on"),
@@ -692,11 +740,11 @@ async def cb_watch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _, mode = query.data.split("|", 1)
 
     if mode == "on":
-        wl = {
-            code: {"name": name, "expire": None}
-            for code, name in WATCH_TARGETS.items()
-        }
-        await query.answer(f"✅ 전체 {len(wl)}개 종목 켰습니다")
+        # 기본 35개를 모두 켜되, /add 로 추가한 커스텀 종목은 유지
+        wl = get_user_watchlist(chat_id)
+        for code, name in WATCH_TARGETS.items():
+            wl.setdefault(code, {"name": name, "expire": None})
+        await query.answer(f"✅ 모두 켰습니다 (총 {len(wl)}개)")
     else:
         wl = {}
         await query.answer("⬜ 전체 종목 껐습니다")
@@ -787,6 +835,66 @@ async def cb_ema(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
+# ----------------------------------------------------------------------------
+# /add : 원하는 종목을 이름/코드로 검색해 내 목록에 추가 (35개 카탈로그 밖도 가능)
+# ----------------------------------------------------------------------------
+def _add_stock_to_user(chat_id, code: str, name: str) -> None:
+    wl = get_user_watchlist(chat_id)
+    wl[code] = {"name": name, "expire": None}
+    save_user_watchlist(chat_id, wl)
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "사용법: /add 종목이름 또는 코드\n예) /add 한미반도체   또는   /add 042700"
+        )
+        return
+    query = " ".join(context.args).strip()
+    await update.message.reply_text(f"🔎 '{query}' 검색 중...")
+    matches = await asyncio.to_thread(search_stocks, query)
+    if not matches:
+        await update.message.reply_text(
+            f"'{query}' 종목을 찾지 못했습니다. 이름 일부나 6자리 코드로 다시 시도해보세요."
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    if len(matches) == 1:
+        code, name = matches[0]
+        _add_stock_to_user(chat_id, code, name)
+        await update.message.reply_text(
+            f"✅ *{name}* (`{code}`) 추가됐습니다.\n/watch 에서 켜짐 상태를 확인할 수 있어요.",
+            parse_mode="Markdown",
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton(f"{n} ({c})", callback_data=f"add|{c}")]
+        for c, n in matches
+    ]
+    await update.message.reply_text(
+        f"🔎 '{query}' 검색 결과 {len(matches)}건 — 추가할 종목을 고르세요:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cb_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    _, code = query.data.split("|", 1)
+    name = get_stock_listing().get(code, code)
+    _add_stock_to_user(chat_id, code, name)
+    await query.answer(f"✅ {name} 추가됨")
+    try:
+        await query.edit_message_text(
+            f"✅ *{name}* (`{code}`) 추가됐습니다.\n/watch 에서 확인/끄기 할 수 있어요.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wl = get_user_watchlist(update.effective_chat.id)
     today = datetime.now(KST).date()
@@ -849,6 +957,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("watch", cmd_watch))
+    app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("ema", cmd_ema))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("check", cmd_check))
@@ -857,6 +966,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_watch_all, pattern=r"^watchall\|"))
     app.add_handler(CallbackQueryHandler(cb_watch, pattern=r"^watch\|"))
     app.add_handler(CallbackQueryHandler(cb_ema, pattern=r"^ema\|"))
+    app.add_handler(CallbackQueryHandler(cb_add, pattern=r"^add\|"))
 
     # ----- 스케줄러 (JobQueue) -----
     # 한국시간 평일에만 의미가 있으므로 시간만 지정하고
