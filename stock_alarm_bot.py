@@ -8,8 +8,8 @@
  - 코스피 지수, 섹터 대표주, 코스피 시총 1~30위, 코스닥 시총 1~5위 감시
  - 일봉(5/20/60/120), 주봉(5/20) **EMA** ±0.5% 진입 시 텔레그램 알람
  - 상승 돌파 / 하락 돌파 구분 (각 방향당 하루 1회)
- - 사용자가 종목별로 알람 기한(3/5/7일 또는 무제한)을 인라인 버튼으로 설정
- - 만료일이 지난 종목은 자동 감시 제외
+ - 사람별 개인 워치리스트 : 각자 /watch 로 켠 종목 알람을 자기만 받음
+ - /watch 인라인 버튼으로 종목 켜기✅/끄기⬜ (모두 켜기/끄기 지원)
  - python-telegram-bot 의 JobQueue 로 장중/장마감 주기 체크
 
 [설치]
@@ -531,11 +531,9 @@ HELP_TEXT = (
     "/start - 봇 시작 & 도움말\n"
     "/help - 도움말\n"
     "/myid - 내 챗ID / 켜둔 종목 수 확인\n"
-    "/watch - 알람 받을 종목 선택 (켜기✅/끄기⬜)\n"
+    "/watch - 알람 받을 종목 선택 (켜기✅/끄기⬜, 모두 켜기/끄기)\n"
     "/list - 내가 감시 중인 종목 보기\n"
-    "/set - 종목 알람 기한 설정 (대화형)\n"
-    "/check - 지금 즉시 1회 EMA 체크 실행\n"
-    "/stop\\_code <종목코드> - 해당 종목 감시 즉시 해제\n\n"
+    "/check - 지금 즉시 1회 EMA 체크 실행\n\n"
     f"*조건*: 현재가가 EMA 라인 ±{TOUCH_THRESHOLD_PCT}% 범위 진입 시 알람\n"
     "  - 일봉 EMA 5/20/60/120\n"
     "  - 주봉 EMA 5/20\n"
@@ -576,7 +574,11 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_watch_keyboard(chat_id) -> InlineKeyboardMarkup:
     wl = get_user_watchlist(chat_id)
     items = sorted(WATCH_TARGETS.items(), key=lambda kv: kv[1])
-    buttons = []
+    # 맨 위에 일괄 켜기/끄기 버튼
+    buttons = [[
+        InlineKeyboardButton("✅ 모두 켜기", callback_data="watchall|on"),
+        InlineKeyboardButton("⬜ 모두 끄기", callback_data="watchall|off"),
+    ]]
     row = []
     for code, name in items:
         mark = "✅" if code in wl else "⬜"
@@ -629,6 +631,35 @@ async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
+async def cb_watch_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """모두 켜기 / 모두 끄기"""
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    _, mode = query.data.split("|", 1)
+
+    if mode == "on":
+        wl = {
+            code: {"name": name, "expire": None}
+            for code, name in WATCH_TARGETS.items()
+        }
+        await query.answer(f"✅ 전체 {len(wl)}개 종목 켰습니다")
+    else:
+        wl = {}
+        await query.answer("⬜ 전체 종목 껐습니다")
+    save_user_watchlist(chat_id, wl)
+
+    try:
+        await query.edit_message_text(
+            f"🔔 *알람 받을 종목 선택* (현재 {len(wl)}개 켜짐)\n"
+            "탭하면 켜짐 ✅ / 꺼짐 ⬜ 으로 전환됩니다.\n"
+            "_여기서 켠 종목은 당신에게만 알람이 옵니다._",
+            reply_markup=build_watch_keyboard(chat_id),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wl = get_user_watchlist(update.effective_chat.id)
     today = datetime.now(KST).date()
@@ -652,132 +683,10 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /set : 종목 선택 → 기한 선택 (인라인 키보드 2단계)
-    """
-    wl = get_user_watchlist(update.effective_chat.id)
-    if not wl:
-        await update.message.reply_text(
-            "켜둔 종목이 없습니다. 먼저 /watch 로 종목을 켜주세요."
-        )
-        return
-
-    # 종목이 많을 수 있으므로 2열로 배치
-    items = sorted(wl.items(), key=lambda kv: kv[1]["name"])
-    buttons = []
-    row = []
-    for code, info in items:
-        row.append(
-            InlineKeyboardButton(
-                f"{info['name']}", callback_data=f"pick|{code}"
-            )
-        )
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    await update.message.reply_text(
-        "기한을 설정할 종목을 선택하세요:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
-
-async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """종목 선택 후 → 기한 버튼 표시"""
-    query = update.callback_query
-    await query.answer()
-
-    _, code = query.data.split("|", 1)
-    wl = get_user_watchlist(update.effective_chat.id)
-    name = wl.get(code, {}).get("name", WATCH_TARGETS.get(code, code))
-
-    keyboard = [
-        [
-            InlineKeyboardButton("3일", callback_data=f"days|{code}|3"),
-            InlineKeyboardButton("5일", callback_data=f"days|{code}|5"),
-        ],
-        [
-            InlineKeyboardButton("7일", callback_data=f"days|{code}|7"),
-            InlineKeyboardButton("무제한", callback_data=f"days|{code}|0"),
-        ],
-        [
-            InlineKeyboardButton("❌ 감시 해제", callback_data=f"days|{code}|-1"),
-        ],
-    ]
-    await query.edit_message_text(
-        text=f"*{name}* (`{code}`) — 며칠 동안 알람을 받으시겠습니까?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
-
-
-async def cb_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """기한 선택 콜백 처리"""
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        _, code, days_str = query.data.split("|", 2)
-        days = int(days_str)
-    except Exception:
-        await query.edit_message_text("잘못된 입력입니다.")
-        return
-
-    chat_id = update.effective_chat.id
-    wl = get_user_watchlist(chat_id)
-    if code not in wl:
-        wl[code] = {"name": WATCH_TARGETS.get(code, code), "expire": None}
-
-    name = wl[code]["name"]
-
-    if days == -1:
-        # 감시 해제
-        del wl[code]
-        save_user_watchlist(chat_id, wl)
-        await query.edit_message_text(
-            f"❌ *{name}* (`{code}`) 감시를 해제했습니다.",
-            parse_mode="Markdown",
-        )
-        return
-
-    if days == 0:
-        wl[code]["expire"] = None
-        msg = f"✅ *{name}* (`{code}`) — *무제한* 감시로 설정했습니다."
-    else:
-        expire_date = datetime.now(KST).date() + timedelta(days=days)
-        wl[code]["expire"] = expire_date.strftime("%Y-%m-%d")
-        msg = (
-            f"✅ *{name}* (`{code}`) — 앞으로 *{days}일*간 감시합니다.\n"
-            f"   만료일: {wl[code]['expire']}"
-        )
-
-    save_user_watchlist(chat_id, wl)
-    await query.edit_message_text(msg, parse_mode="Markdown")
-
-
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("⏳ 지금 즉시 EMA 체크를 실행합니다...")
     await scheduled_check(context)
     await update.message.reply_text("✅ 체크 완료.")
-
-
-async def cmd_stop_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("사용법: /stop_code <종목코드>\n예) /stop_code 005930")
-        return
-    code = context.args[0].strip()
-    chat_id = update.effective_chat.id
-    wl = get_user_watchlist(chat_id)
-    if code in wl:
-        name = wl[code]["name"]
-        del wl[code]
-        save_user_watchlist(chat_id, wl)
-        await update.message.reply_text(f"❌ {name}({code}) 감시 해제 완료.")
-    else:
-        await update.message.reply_text(f"`{code}` 는 내 감시 목록에 없습니다.", parse_mode="Markdown")
 
 
 # ============================================================================
@@ -814,14 +723,11 @@ def main() -> None:
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("watch", cmd_watch))
     app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("check", cmd_check))
-    app.add_handler(CommandHandler("stop_code", cmd_stop_code))
 
     # 인라인 버튼 콜백
+    app.add_handler(CallbackQueryHandler(cb_watch_all, pattern=r"^watchall\|"))
     app.add_handler(CallbackQueryHandler(cb_watch, pattern=r"^watch\|"))
-    app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick\|"))
-    app.add_handler(CallbackQueryHandler(cb_days, pattern=r"^days\|"))
 
     # ----- 스케줄러 (JobQueue) -----
     # 한국시간 평일에만 의미가 있으므로 시간만 지정하고
