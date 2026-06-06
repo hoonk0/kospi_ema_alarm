@@ -79,12 +79,10 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "여기에_봇_토큰_입력")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "여기에_챗ID_입력")
 
-# 알람을 받을 챗ID 목록.
-#   여러 명에게 보내려면 환경변수에 쉼표로 구분해 넣으면 됩니다.
-#     예) TELEGRAM_CHAT_ID="1567993608,123456789,987654321"
-#   ※ 각 사람은 먼저 봇에게 /start 를 한 번 보내야 메시지를 받을 수 있습니다.
-#     (봇한테 /myid 를 보내면 본인 챗ID를 알려줍니다.)
-CHAT_IDS = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
+# (참고) 이 봇은 '사람별 개인 워치리스트' 방식입니다.
+#   - 누구든 봇에게 /start 후 /watch 로 종목을 켜면, 그 사람에게만 알람이 갑니다.
+#   - 따로 수신자 목록을 관리할 필요 없이, 종목을 켠 사람이 곧 수신자입니다.
+#   TELEGRAM_CHAT_ID 는 실행 설정이 됐는지 확인(검증)하는 용도로만 남겨둡니다.
 
 # 이평선 ±N% 진입 시 알람 (요구사항: 0.5%)
 TOUCH_THRESHOLD_PCT = 0.5
@@ -191,19 +189,37 @@ def save_json(path: str, data) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def load_watchlist() -> Dict[str, Dict]:
+def load_all_watchlists() -> Dict[str, Dict[str, Dict]]:
     """
-    반환 구조:
+    사람별 개인 워치리스트. 반환 구조:
     {
-      "005930": {"name": "삼성전자", "expire": "2026-06-01" or null}
+      "1567993608": {                                  # 챗ID
+          "005930": {"name": "삼성전자", "expire": "2026-06-01" or null}
+      },
+      "8848174466": { ... }
     }
     expire 가 None 이면 무제한 감시
     """
     return load_json(WATCHLIST_FILE, {})
 
 
-def save_watchlist(wl: Dict[str, Dict]) -> None:
-    save_json(WATCHLIST_FILE, wl)
+def save_all_watchlists(data: Dict[str, Dict[str, Dict]]) -> None:
+    save_json(WATCHLIST_FILE, data)
+
+
+def get_user_watchlist(chat_id) -> Dict[str, Dict]:
+    """특정 사용자(챗ID)의 워치리스트 {종목코드: 정보} 반환 (없으면 빈 dict)."""
+    return load_all_watchlists().get(str(chat_id), {})
+
+
+def save_user_watchlist(chat_id, wl: Dict[str, Dict]) -> None:
+    """특정 사용자의 워치리스트를 저장. 빈 dict 면 해당 사용자 항목을 제거."""
+    data = load_all_watchlists()
+    if wl:
+        data[str(chat_id)] = wl
+    else:
+        data.pop(str(chat_id), None)
+    save_all_watchlists(data)
 
 
 def load_sent_log() -> Dict[str, List[str]]:
@@ -220,27 +236,26 @@ def save_sent_log(data: Dict) -> None:
     save_json(SENT_LOG_FILE, data)
 
 
-def already_sent_today(code: str, ma_label: str) -> bool:
+def already_sent_today(chat_id, code: str, ma_label: str) -> bool:
+    """사용자별로 중복 방지. (같은 알람이라도 사람마다 따로 1회씩 발송)"""
     data = load_sent_log()
-    return f"{code}:{ma_label}" in data["keys"]
+    return f"{chat_id}:{code}:{ma_label}" in data["keys"]
 
 
-def mark_sent_today(code: str, ma_label: str) -> None:
+def mark_sent_today(chat_id, code: str, ma_label: str) -> None:
     data = load_sent_log()
-    key = f"{code}:{ma_label}"
+    key = f"{chat_id}:{code}:{ma_label}"
     if key not in data["keys"]:
         data["keys"].append(key)
         save_sent_log(data)
 
 
 # ============================================================================
-# 워치리스트 로드 (opt-in 방식)
-#   - 기본은 '빈 목록' : 아무 종목도 감시하지 않음
-#   - 사용자가 /watch 로 켠 종목만 watchlist.json 에 들어가고, 그것만 감시함
+# 워치리스트 방식 메모 (opt-in, 사람별)
+#   - 기본은 '빈 목록' : 아무도/아무 종목도 감시하지 않음
+#   - 각 사용자가 /watch 로 켠 종목만 그 사람 워치리스트에 들어가고, 그 사람만 받음
 #   - WATCH_TARGETS 는 '고를 수 있는 전체 후보 목록(카탈로그)' 역할만 함
 # ============================================================================
-def ensure_default_watchlist() -> Dict[str, Dict]:
-    return load_watchlist()
 
 
 # ============================================================================
@@ -325,9 +340,12 @@ def detect_breakout(
 
 
 # ============================================================================
-# 핵심 체크 로직 : 알람을 보낼 메시지 리스트 생성
+# 핵심 체크 로직 : 한 종목의 돌파 알람 계산
+#   - 사용자와 무관하게 '이 종목이 지금 어떤 EMA 를 돌파했는지'만 계산한다.
+#   - 중복방지/발송은 호출하는 쪽(scheduled_check)에서 사용자별로 처리한다.
+#   - 반환: [(sent_key, 메시지), ...]   sent_key = "라벨|방향" (예: "일봉 EMA20|상승")
 # ============================================================================
-def build_alerts_for_code(code: str, name: str) -> List[str]:
+def compute_alerts_for_code(code: str, name: str) -> List[Tuple[str, str]]:
     df = fetch_price_df(code, days=400)
     if df is None or df.empty:
         return []
@@ -342,7 +360,7 @@ def build_alerts_for_code(code: str, name: str) -> List[str]:
     daily_emas = compute_daily_emas(df, DAILY_EMAS)
     weekly_emas = compute_weekly_emas(df, WEEKLY_EMAS)
 
-    messages: List[str] = []
+    alerts: List[Tuple[str, str]] = []
 
     def fmt_msg(ema_label: str, ema_val: float, direction: str) -> str:
         diff_pct = (last_close - ema_val) / ema_val * 100.0
@@ -369,10 +387,7 @@ def build_alerts_for_code(code: str, name: str) -> List[str]:
         if direction is None:
             continue
         label = f"일봉 EMA{w}"
-        sent_key = f"{label}|{direction}"   # 방향까지 키에 포함 → 상승/하락 각 1회
-        if not already_sent_today(code, sent_key):
-            messages.append(fmt_msg(label, curr_ema, direction))
-            mark_sent_today(code, sent_key)
+        alerts.append((f"{label}|{direction}", fmt_msg(label, curr_ema, direction)))
 
     # ----- 주봉 EMA 돌파 체크 -----
     # 주봉 EMA 는 주중에는 값이 거의 고정되므로, 일일 종가 변화로 돌파 여부를 판정한다.
@@ -387,46 +402,54 @@ def build_alerts_for_code(code: str, name: str) -> List[str]:
         if direction is None:
             continue
         label = f"주봉 EMA{w}"
-        sent_key = f"{label}|{direction}"
-        if not already_sent_today(code, sent_key):
-            messages.append(fmt_msg(label, curr_ema, direction))
-            mark_sent_today(code, sent_key)
+        alerts.append((f"{label}|{direction}", fmt_msg(label, curr_ema, direction)))
 
-    return messages
+    return alerts
 
 
 # ============================================================================
-# 만료된 워치리스트 정리 & 활성 종목 반환
+# 만료된 워치리스트 정리 & 사용자별 활성 종목 반환
+#   반환: { 챗ID: { 종목코드: 종목명 } }  — 만료되지 않은 활성 종목만
 # ============================================================================
-def get_active_targets() -> List[Tuple[str, str]]:
-    wl = ensure_default_watchlist()
+def get_active_user_targets() -> Dict[str, Dict[str, str]]:
+    all_wls = load_all_watchlists()
     today = datetime.now(KST).date()
-    active: List[Tuple[str, str]] = []
     changed = False
+    result: Dict[str, Dict[str, str]] = {}
 
-    for code, info in list(wl.items()):
-        expire = info.get("expire")
-        if expire is None:
-            active.append((code, info["name"]))
-            continue
-        try:
-            exp_date = datetime.strptime(expire, "%Y-%m-%d").date()
-        except Exception:
-            # 잘못된 날짜는 무제한으로 처리
-            info["expire"] = None
-            changed = True
-            active.append((code, info["name"]))
-            continue
-        if exp_date >= today:
-            active.append((code, info["name"]))
+    for chat_id, wl in list(all_wls.items()):
+        active: Dict[str, str] = {}
+        for code, info in list(wl.items()):
+            name = info.get("name", WATCH_TARGETS.get(code, code))
+            expire = info.get("expire")
+            if expire is None:
+                active[code] = name
+                continue
+            try:
+                exp_date = datetime.strptime(expire, "%Y-%m-%d").date()
+            except Exception:
+                # 잘못된 날짜는 무제한으로 처리
+                info["expire"] = None
+                changed = True
+                active[code] = name
+                continue
+            if exp_date >= today:
+                active[code] = name
+            else:
+                logger.info(f"만료 종목 제거: [{chat_id}] {name}({code}) - {expire}")
+                del wl[code]
+                changed = True
+
+        if wl:
+            all_wls[chat_id] = wl
         else:
-            logger.info(f"만료된 감시 종목 제거: {info['name']}({code}) - {expire}")
-            del wl[code]
-            changed = True
+            all_wls.pop(chat_id, None)
+        if active:
+            result[chat_id] = active
 
     if changed:
-        save_watchlist(wl)
-    return active
+        save_all_watchlists(all_wls)
+    return result
 
 
 # ============================================================================
@@ -453,31 +476,46 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("장 시간 외 — 체크 건너뜀")
         return
 
-    targets = get_active_targets()
-    if not targets:
-        logger.info("감시 대상 없음")
+    # 사용자별 활성 종목 { 챗ID: { 종목: 종목명 } }
+    user_targets = get_active_user_targets()
+    if not user_targets:
+        logger.info("감시 대상 없음 (아무도 /watch 로 종목을 켜지 않음)")
         return
 
-    logger.info(f"EMA 체크 시작 ({len(targets)} 종목, 수신자 {len(CHAT_IDS)}명)")
+    # 모든 사용자가 보는 종목의 합집합 → 종목당 데이터는 한 번만 조회
+    all_codes: Dict[str, str] = {}
+    for active in user_targets.values():
+        all_codes.update(active)
+
+    logger.info(
+        f"EMA 체크 시작 ({len(all_codes)} 종목, 사용자 {len(user_targets)}명)"
+    )
     bot = context.bot
 
     alerts_total = 0
-    for code, name in targets:
+    for code, name in all_codes.items():
         try:
-            msgs = build_alerts_for_code(code, name)
-            for m in msgs:
-                # 같은 알람을 등록된 모든 수신자에게 발송
-                for cid in CHAT_IDS:
+            alerts = compute_alerts_for_code(code, name)  # [(sent_key, 메시지)]
+            if not alerts:
+                continue
+            # 이 종목을 켠 사용자에게만, 사용자별 중복방지를 적용해 발송
+            for chat_id, active in user_targets.items():
+                if code not in active:
+                    continue
+                for sent_key, msg in alerts:
+                    if already_sent_today(chat_id, code, sent_key):
+                        continue
                     try:
                         await bot.send_message(
-                            chat_id=cid,
-                            text=m,
+                            chat_id=chat_id,
+                            text=msg,
                             parse_mode="Markdown",
                         )
+                        mark_sent_today(chat_id, code, sent_key)
                         alerts_total += 1
                         await asyncio.sleep(0.3)  # 텔레그램 rate-limit 보호
                     except Exception as e:
-                        logger.warning(f"메시지 전송 실패 (chat {cid}): {e}")
+                        logger.warning(f"메시지 전송 실패 (chat {chat_id}): {e}")
         except Exception as e:
             logger.warning(f"[{code}] 체크 중 오류: {e}")
 
@@ -492,9 +530,9 @@ HELP_TEXT = (
     "*명령어*\n"
     "/start - 봇 시작 & 도움말\n"
     "/help - 도움말\n"
-    "/myid - 내 챗ID 확인 (알람 수신자 추가용)\n"
+    "/myid - 내 챗ID / 켜둔 종목 수 확인\n"
     "/watch - 알람 받을 종목 선택 (켜기✅/끄기⬜)\n"
-    "/list - 현재 감시 중인 종목 보기\n"
+    "/list - 내가 감시 중인 종목 보기\n"
     "/set - 종목 알람 기한 설정 (대화형)\n"
     "/check - 지금 즉시 1회 EMA 체크 실행\n"
     "/stop\\_code <종목코드> - 해당 종목 감시 즉시 해제\n\n"
@@ -506,7 +544,6 @@ HELP_TEXT = (
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ensure_default_watchlist()
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
@@ -515,16 +552,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """본인 챗ID를 알려준다. 새 수신자를 추가할 때 이 ID를 관리자에게 전달하면 됩니다."""
+    """본인 챗ID와 현재 켜둔 종목 수를 알려준다."""
     chat = update.effective_chat
     user = update.effective_user
     name = user.full_name if user else ""
-    registered = "✅ 이미 등록됨" if str(chat.id) in CHAT_IDS else "❌ 아직 미등록"
+    count = len(get_user_watchlist(chat.id))
     await update.message.reply_text(
         f"🆔 *당신의 챗ID*: `{chat.id}`\n"
         f"   이름: {name}\n"
-        f"   알람 수신: {registered}\n\n"
-        "이 ID를 관리자에게 알려주면 알람 수신자로 추가할 수 있습니다.",
+        f"   켜둔 종목: {count}개\n\n"
+        "이 봇은 사람별로 알람이 따로 갑니다. /watch 로 원하는 종목을 켜면 "
+        "당신에게만 그 종목 알람이 옵니다.",
         parse_mode="Markdown",
     )
 
@@ -535,8 +573,8 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 #   - 켜진 종목엔 ✅, 꺼진 종목엔 ⬜ 표시
 #   - 버튼을 탭하면 즉시 ON↔OFF 전환되고 키보드가 갱신됨
 # ----------------------------------------------------------------------------
-def build_watch_keyboard() -> InlineKeyboardMarkup:
-    wl = load_watchlist()
+def build_watch_keyboard(chat_id) -> InlineKeyboardMarkup:
+    wl = get_user_watchlist(chat_id)
     items = sorted(WATCH_TARGETS.items(), key=lambda kv: kv[1])
     buttons = []
     row = []
@@ -552,35 +590,39 @@ def build_watch_keyboard() -> InlineKeyboardMarkup:
 
 
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    wl = load_watchlist()
+    chat_id = update.effective_chat.id
+    wl = get_user_watchlist(chat_id)
     await update.message.reply_text(
         f"🔔 *알람 받을 종목 선택* (현재 {len(wl)}개 켜짐)\n"
-        "탭하면 켜짐 ✅ / 꺼짐 ⬜ 으로 전환됩니다.",
-        reply_markup=build_watch_keyboard(),
+        "탭하면 켜짐 ✅ / 꺼짐 ⬜ 으로 전환됩니다.\n"
+        "_여기서 켠 종목은 당신에게만 알람이 옵니다._",
+        reply_markup=build_watch_keyboard(chat_id),
         parse_mode="Markdown",
     )
 
 
 async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    chat_id = update.effective_chat.id
     _, code = query.data.split("|", 1)
     name = WATCH_TARGETS.get(code, code)
 
-    wl = load_watchlist()
+    wl = get_user_watchlist(chat_id)
     if code in wl:
         del wl[code]
         await query.answer(f"⬜ {name} 알람 꺼짐")
     else:
         wl[code] = {"name": name, "expire": None}  # None = 무제한
         await query.answer(f"✅ {name} 알람 켜짐")
-    save_watchlist(wl)
+    save_user_watchlist(chat_id, wl)
 
     # 키보드(체크표시) 갱신 + 상단 카운트 갱신
     try:
         await query.edit_message_text(
             f"🔔 *알람 받을 종목 선택* (현재 {len(wl)}개 켜짐)\n"
-            "탭하면 켜짐 ✅ / 꺼짐 ⬜ 으로 전환됩니다.",
-            reply_markup=build_watch_keyboard(),
+            "탭하면 켜짐 ✅ / 꺼짐 ⬜ 으로 전환됩니다.\n"
+            "_여기서 켠 종목은 당신에게만 알람이 옵니다._",
+            reply_markup=build_watch_keyboard(chat_id),
             parse_mode="Markdown",
         )
     except Exception:
@@ -588,9 +630,9 @@ async def cb_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    wl = ensure_default_watchlist()
+    wl = get_user_watchlist(update.effective_chat.id)
     today = datetime.now(KST).date()
-    lines = ["*📋 감시 중인 종목 목록*\n"]
+    lines = ["*📋 내가 감시 중인 종목*\n"]
     for code, info in sorted(wl.items(), key=lambda kv: kv[1]["name"]):
         expire = info.get("expire")
         if expire is None:
@@ -602,7 +644,11 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 status = expire
         lines.append(f"• `{code}` {info['name']} — {status}")
-    text = "\n".join(lines) if len(lines) > 1 else "감시 중인 종목이 없습니다."
+    text = (
+        "\n".join(lines)
+        if len(lines) > 1
+        else "감시 중인 종목이 없습니다.\n/watch 로 알람 받을 종목을 켜보세요."
+    )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -610,9 +656,11 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /set : 종목 선택 → 기한 선택 (인라인 키보드 2단계)
     """
-    wl = ensure_default_watchlist()
+    wl = get_user_watchlist(update.effective_chat.id)
     if not wl:
-        await update.message.reply_text("등록된 종목이 없습니다.")
+        await update.message.reply_text(
+            "켜둔 종목이 없습니다. 먼저 /watch 로 종목을 켜주세요."
+        )
         return
 
     # 종목이 많을 수 있으므로 2열로 배치
@@ -643,8 +691,8 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
 
     _, code = query.data.split("|", 1)
-    wl = ensure_default_watchlist()
-    name = wl.get(code, {}).get("name", code)
+    wl = get_user_watchlist(update.effective_chat.id)
+    name = wl.get(code, {}).get("name", WATCH_TARGETS.get(code, code))
 
     keyboard = [
         [
@@ -678,7 +726,8 @@ async def cb_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_text("잘못된 입력입니다.")
         return
 
-    wl = ensure_default_watchlist()
+    chat_id = update.effective_chat.id
+    wl = get_user_watchlist(chat_id)
     if code not in wl:
         wl[code] = {"name": WATCH_TARGETS.get(code, code), "expire": None}
 
@@ -687,7 +736,7 @@ async def cb_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if days == -1:
         # 감시 해제
         del wl[code]
-        save_watchlist(wl)
+        save_user_watchlist(chat_id, wl)
         await query.edit_message_text(
             f"❌ *{name}* (`{code}`) 감시를 해제했습니다.",
             parse_mode="Markdown",
@@ -705,7 +754,7 @@ async def cb_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"   만료일: {wl[code]['expire']}"
         )
 
-    save_watchlist(wl)
+    save_user_watchlist(chat_id, wl)
     await query.edit_message_text(msg, parse_mode="Markdown")
 
 
@@ -720,14 +769,15 @@ async def cmd_stop_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("사용법: /stop_code <종목코드>\n예) /stop_code 005930")
         return
     code = context.args[0].strip()
-    wl = ensure_default_watchlist()
+    chat_id = update.effective_chat.id
+    wl = get_user_watchlist(chat_id)
     if code in wl:
         name = wl[code]["name"]
         del wl[code]
-        save_watchlist(wl)
+        save_user_watchlist(chat_id, wl)
         await update.message.reply_text(f"❌ {name}({code}) 감시 해제 완료.")
     else:
-        await update.message.reply_text(f"`{code}` 는 감시 목록에 없습니다.", parse_mode="Markdown")
+        await update.message.reply_text(f"`{code}` 는 내 감시 목록에 없습니다.", parse_mode="Markdown")
 
 
 # ============================================================================
@@ -744,9 +794,6 @@ def main() -> None:
             "❌ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 가 설정되지 않았습니다.\n"
             "   환경변수로 지정하거나 코드 상단 CONFIG 영역을 수정하세요."
         )
-
-    # 워치리스트 기본값 채워두기
-    ensure_default_watchlist()
 
     # connect_timeout 을 넉넉히 둬서 회선이 느려도 부팅 실패하지 않도록 함
     app = (
