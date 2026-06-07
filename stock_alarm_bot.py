@@ -70,9 +70,11 @@ import FinanceDataReader as fdr
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    TypeHandler,
 )
 
 
@@ -86,6 +88,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "여기에_챗ID_입력")
 #   - 누구든 봇에게 /start 후 /watch 로 종목을 켜면, 그 사람에게만 알람이 갑니다.
 #   - 따로 수신자 목록을 관리할 필요 없이, 종목을 켠 사람이 곧 수신자입니다.
 #   TELEGRAM_CHAT_ID 는 실행 설정이 됐는지 확인(검증)하는 용도로만 남겨둡니다.
+
+# 봇을 쓸 수 있는 허용 사용자(챗ID) 목록. 쉼표로 구분.
+#   예) ALLOWED_CHAT_IDS="1567993608,8848174466"
+#   - 비어 있으면(미설정) 누구나 사용 가능(제한 없음)
+#   - 값이 있으면 목록에 있는 사람만 사용 가능, 그 외는 차단(본인 ID 안내)
+ALLOWED_CHAT_IDS = [
+    c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()
+]
 
 # 이평선 ±N% 진입 시 알람 (요구사항: 0.5%)
 TOUCH_THRESHOLD_PCT = 0.5
@@ -925,6 +935,33 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ============================================================================
+# 접근 제어 : 허용된 챗ID만 사용 가능 (ALLOWED_CHAT_IDS 가 비어 있으면 전체 허용)
+#   모든 메시지/버튼보다 먼저(group=-1) 실행되어, 미허용 사용자는 여기서 차단.
+# ============================================================================
+async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ALLOWED_CHAT_IDS:
+        return  # 제한 없음
+
+    chat = update.effective_chat
+    if chat is None or str(chat.id) in ALLOWED_CHAT_IDS:
+        return  # 허용된 사용자 → 통과
+
+    # 미허용 사용자 → 본인 ID 안내 후 처리 중단
+    if update.message:
+        await update.message.reply_text(
+            "⛔ 이 봇은 허용된 사용자만 쓸 수 있어요.\n"
+            "관리자에게 아래 ID를 알려주고 등록을 요청하세요:\n"
+            f"🆔 `{chat.id}`",
+            parse_mode="Markdown",
+        )
+    elif update.callback_query:
+        await update.callback_query.answer(
+            "⛔ 허용된 사용자만 사용할 수 있습니다.", show_alert=True
+        )
+    raise ApplicationHandlerStop
+
+
+# ============================================================================
 # 봇 실행
 # ============================================================================
 def main() -> None:
@@ -953,6 +990,9 @@ def main() -> None:
     )
 
     # 명령어 핸들러 등록
+    # 접근 제어 게이트 (다른 모든 핸들러보다 먼저 실행)
+    app.add_handler(TypeHandler(Update, access_gate), group=-1)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("myid", cmd_myid))
